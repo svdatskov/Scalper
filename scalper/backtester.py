@@ -1,8 +1,14 @@
 """Historical replay engine for backtesting the scalping strategy.
 
-Reads tick or 1-second bar data from CSV/Parquet, replays through the
-same indicator + signal + execution pipeline, and produces performance
-reports.
+Reads tick data or OHLCV bar data (1-second, etc.) from CSV/Parquet,
+replays through the same indicator + signal + execution pipeline, and
+produces performance reports.
+
+Supported CSV column layouts::
+
+    Tick data:    timestamp, price, size [, side]
+    Bar data:     timestamp|ts_event, open, high, low, close, volume
+                  [, buy_volume, sell_volume]
 """
 
 from __future__ import annotations
@@ -148,11 +154,18 @@ class Backtester:
     def _load_data(self) -> pd.DataFrame:
         """Load tick/bar data from CSV or Parquet.
 
-        Expected columns for tick data: ``timestamp, price, size``
-        Expected columns for bar data: ``timestamp, open, high, low, close, volume``
+        Supported column layouts:
+
+        - Tick data: ``timestamp, price, size [, side]``
+        - Bar data:  ``timestamp, open, high, low, close, volume [, buy_volume, sell_volume]``
+        - 1-sec bar: ``ts_event, open, high, low, close, volume``
+
+        The loader auto-detects common column name variants
+        (``ts_event`` → ``timestamp``) and converts ISO-8601 or
+        millisecond timestamps to epoch seconds.
 
         Returns:
-            DataFrame sorted by timestamp.
+            DataFrame sorted by ``timestamp`` (epoch seconds).
         """
         path = Path(self._data_file)
         if not path.exists():
@@ -163,13 +176,31 @@ class Backtester:
         else:
             df = pd.read_csv(path)
 
-        # Normalise timestamp
+        # ── Normalise column names ───────────────────────────
+        rename_map: dict[str, str] = {}
+        if "ts_event" in df.columns and "timestamp" not in df.columns:
+            rename_map["ts_event"] = "timestamp"
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+        # ── Normalise timestamp to epoch seconds ─────────────
         if "timestamp" in df.columns:
             if df["timestamp"].dtype == object:
-                df["timestamp"] = pd.to_datetime(df["timestamp"]).astype(int) // 10**9
+                # ISO-8601 strings (e.g. "2026-02-15 23:00:00+00:00")
+                df["timestamp"] = (
+                    pd.to_datetime(df["timestamp"], utc=True)
+                    .astype("int64") // 10**9
+                )
+            elif hasattr(df["timestamp"].dtype, "tz") or pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                # Already datetime dtype (from parquet or tz-aware)
+                df["timestamp"] = (
+                    pd.to_datetime(df["timestamp"], utc=True)
+                    .astype("int64") // 10**9
+                )
             elif df["timestamp"].max() > 1e12:
                 # Milliseconds
                 df["timestamp"] = df["timestamp"] / 1000.0
+            # else: already epoch seconds
 
         df = df.sort_values("timestamp").reset_index(drop=True)
         logger.info("Loaded %d rows from %s", len(df), self._data_file)
@@ -187,14 +218,19 @@ class Backtester:
         """
         self._trade_logger.open()
         data = self._load_data()
-        is_tick = "price" in data.columns
 
         self._equity = self._initial_equity
         self._equity_curve = [(0, self._equity)]
         self._risk_manager.reset_daily(self._equity)
         self._indicators.reset_session()
 
-        # Aggregators
+        # Determine data layout
+        is_tick = "price" in data.columns
+        is_sub_bar = not is_tick and "open" in data.columns
+
+        # Aggregators — used when replaying tick or sub-bar data
+        # through the execution (5-sec) and confirmation (1-min)
+        # timeframes.
         exec_agg = BarAggregator(
             bar_type=self._cfg["data"]["execution_bar_type"],
             bar_size=self._cfg["data"]["execution_bar_size"]
@@ -221,9 +257,10 @@ class Backtester:
                 min_agg.reset()
 
             if is_tick:
+                # ── Raw tick data ────────────────────────────
                 price = float(row["price"])
                 size = float(row.get("size", 1))
-                side = "BUY"  # Simplified; real data should include side
+                side = "BUY"
                 if "side" in row.index:
                     side = str(row["side"]).upper()
                 elif price > self._last_sim_price:
@@ -236,21 +273,25 @@ class Backtester:
                 self._last_sim_price = price
                 exec_agg.on_tick(price, size, side, ts)
                 min_agg.on_tick(price, size, side, ts)
-            else:
-                # Bar data — treat each row as a completed bar
-                bar = Bar(
-                    timestamp=ts,
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                    volume=float(row.get("volume", 0)),
-                    buy_volume=float(row.get("buy_volume", row.get("volume", 0) / 2)),
-                    sell_volume=float(row.get("sell_volume", row.get("volume", 0) / 2)),
-                )
-                self._last_sim_price = bar.close
-                self._on_exec_bar(bar)
-                self._on_1min_bar(bar)
+
+            elif is_sub_bar:
+                # ── 1-second (or other sub-bar) OHLCV data ──
+                # Synthesise 4 ticks per bar (O→H→L→C) so the
+                # 5-sec and 1-min aggregators build proper bars.
+                o = float(row["open"])
+                h = float(row["high"])
+                l = float(row["low"])  # noqa: E741
+                c = float(row["close"])
+                vol = float(row.get("volume", 0))
+                quarter_vol = max(vol / 4.0, 1.0)
+
+                for tick_price in (o, h, l, c):
+                    side = "BUY" if tick_price >= self._last_sim_price else "SELL"
+                    if tick_price == self._last_sim_price:
+                        side = "UNKNOWN"
+                    self._last_sim_price = tick_price
+                    exec_agg.on_tick(tick_price, quarter_vol, side, ts)
+                    min_agg.on_tick(tick_price, quarter_vol, side, ts)
 
             # Manage exits on every row
             if self._execution.has_position:
