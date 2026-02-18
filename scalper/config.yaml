@@ -52,7 +52,7 @@ entry:
 
   # Volatility filter
   atr_min: 1.5                 # Minimum 1-min ATR to trade
-  atr_max: 8.0                 # Maximum 1-min ATR to trade
+  atr_max: 40.0                # Maximum 1-min ATR to trade (MNQ typical: 5-35 pts)
 
 # --- Time Filter ---
 time_filter:

@@ -106,6 +106,7 @@ class Backtester:
         # Bar collectors
         self._exec_bars: list[Bar] = []
         self._min_bars: list[Bar] = []
+        self._last_exec_volume: float = 0.0
 
     # ─────────────────────────────────────────────────────────
     # Simulated order execution
@@ -396,7 +397,7 @@ class Backtester:
                     datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc),
                     self._cfg["exits"]["eod_close_time"],
                 )
-                state = self._indicators.snapshot(self._last_sim_price, 0)
+                state = self._indicators.snapshot(self._last_sim_price, self._last_exec_volume)
                 await self._execution.manage_exits(
                     self._last_sim_price, state, ts, is_eod=eod,
                 )
@@ -407,7 +408,7 @@ class Backtester:
                 if not can:
                     _diag_risk_blocked += 1
                 if can:
-                    state = self._indicators.snapshot(self._last_sim_price, 0)
+                    state = self._indicators.snapshot(self._last_sim_price, self._last_exec_volume)
                     dt_et = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc).astimezone(ET)
                     result = self._signal_engine.evaluate(state, dt_et)
 
@@ -447,8 +448,23 @@ class Backtester:
             logger.info("Signal evaluations: %d (risk-blocked: %d)", _diag_evals, _diag_risk_blocked)
             for label, failures in [("LONG", _diag_long_failures), ("SHORT", _diag_short_failures)]:
                 if failures:
-                    logger.info("%s failure breakdown:", label)
-                    for reason, count in sorted(failures.items(), key=lambda x: -x[1]):
+                    # Collapse atr_out_of_range variants into one summary
+                    collapsed: dict[str, int] = {}
+                    atr_total = 0
+                    for reason, count in failures.items():
+                        if reason.startswith("atr_out_of_range"):
+                            atr_total += count
+                        else:
+                            collapsed[reason] = count
+                    if atr_total:
+                        collapsed["atr_out_of_range (all values)"] = atr_total
+
+                    logger.info("%s failure breakdown (top 10):", label)
+                    for i, (reason, count) in enumerate(
+                        sorted(collapsed.items(), key=lambda x: -x[1])
+                    ):
+                        if i >= 10:
+                            break
                         pct = count / _diag_evals * 100
                         logger.info("  %-35s %5d  (%5.1f%%)", reason, count, pct)
         else:
@@ -487,6 +503,7 @@ class Backtester:
         """Process an execution-timeframe bar."""
         self._indicators.on_exec_bar(bar)
         self._exec_bars.append(bar)
+        self._last_exec_volume = bar.volume
 
     def _on_1min_bar(self, bar: Bar) -> None:
         """Process a 1-minute bar."""
