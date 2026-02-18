@@ -226,6 +226,40 @@ class Backtester:
         self._risk_manager.reset_daily(self._equity)
         self._indicators.reset_session()
 
+        # ── Diagnostics: data time range ─────────────────────
+        first_ts = float(data["timestamp"].iloc[0])
+        last_ts = float(data["timestamp"].iloc[-1])
+        first_et = datetime.utcfromtimestamp(first_ts).replace(tzinfo=pytz.utc).astimezone(ET)
+        last_et = datetime.utcfromtimestamp(last_ts).replace(tzinfo=pytz.utc).astimezone(ET)
+        logger.info(
+            "Data time range (ET): %s → %s  (%d rows, %.1f hours)",
+            first_et.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            last_et.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            len(data),
+            (last_ts - first_ts) / 3600,
+        )
+
+        # Count rows inside/outside RTH trading windows
+        rth_count = 0
+        for _, r in data.iterrows():
+            dt_et = datetime.utcfromtimestamp(float(r["timestamp"])).replace(
+                tzinfo=pytz.utc
+            ).astimezone(ET)
+            if self._time_filter.is_trading_allowed(dt_et):
+                rth_count += 1
+        logger.info(
+            "Rows inside RTH trading windows: %d / %d (%.1f%%)",
+            rth_count, len(data),
+            rth_count / len(data) * 100 if data.shape[0] > 0 else 0,
+        )
+        if rth_count == 0:
+            logger.warning(
+                "⚠ NO DATA falls within the configured trading windows "
+                "(sessions: %s, timezone: %s). No trades will be generated.",
+                self._cfg["time_filter"]["sessions"],
+                self._cfg["time_filter"]["timezone"],
+            )
+
         # Determine data layout
         is_tick = "price" in data.columns
         is_sub_bar = not is_tick and "open" in data.columns
@@ -244,6 +278,10 @@ class Backtester:
 
         total_rows = len(data)
         report_interval = max(1, total_rows // 20)
+
+        # Diagnostic counters for signal failures
+        _diag_evals = 0
+        _diag_failures: dict[str, int] = {}
 
         for idx, row in data.iterrows():
             ts = float(row["timestamp"])
@@ -313,6 +351,13 @@ class Backtester:
                     state = self._indicators.snapshot(self._last_sim_price, 0)
                     dt_et = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc).astimezone(ET)
                     result = self._signal_engine.evaluate(state, dt_et)
+
+                    # Track why signals fail
+                    _diag_evals += 1
+                    if result.signal == Signal.HOLD and result.failed:
+                        for f in result.failed:
+                            _diag_failures[f] = _diag_failures.get(f, 0) + 1
+
                     if result.signal in (Signal.BUY, Signal.SELL):
                         # Compute stop and size
                         stop_dist = max(
@@ -333,6 +378,19 @@ class Backtester:
             if int(idx) % report_interval == 0:  # type: ignore[arg-type]
                 pct = int(idx) / total_rows * 100  # type: ignore[arg-type]
                 logger.info("Backtest progress: %.0f%% | Equity: $%.2f", pct, self._equity)
+
+        # ── Signal failure diagnostics ────────────────────────
+        if _diag_evals > 0:
+            logger.info("Signal evaluations: %d", _diag_evals)
+            logger.info("Signal failure breakdown (most common first):")
+            for reason, count in sorted(_diag_failures.items(), key=lambda x: -x[1]):
+                pct = count / _diag_evals * 100
+                logger.info("  %-35s %5d  (%5.1f%%)", reason, count, pct)
+        else:
+            logger.warning(
+                "No signal evaluations occurred — all rows were either "
+                "outside trading windows or blocked by risk manager."
+            )
 
         # Force-close any remaining position
         if self._execution.has_position:
