@@ -1,0 +1,17 @@
+[
+  {
+    "datetime": "2024-06-07T08:30:00-04:00",
+    "event": "Non-Farm Payrolls",
+    "impact": "high"
+  },
+  {
+    "datetime": "2024-06-12T08:30:00-04:00",
+    "event": "CPI",
+    "impact": "high"
+  },
+  {
+    "datetime": "2024-06-12T14:00:00-04:00",
+    "event": "FOMC Rate Decision",
+    "impact": "high"
+  }
+]

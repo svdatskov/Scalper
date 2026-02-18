@@ -1,0 +1,128 @@
+# ═══════════════════════════════════════════════════════════════
+# NQ/MNQ Scalping Bot Configuration
+# ═══════════════════════════════════════════════════════════════
+
+# --- Broker / Connection ---
+broker:
+  gateway_host: "127.0.0.1"
+  gateway_port: 7497          # 7497 = TWS paper, 7496 = TWS live, 4002 = IB Gateway paper
+  client_id: 1
+  account: ""                 # Leave empty to use default account
+  timeout: 30                 # Connection timeout in seconds
+  readonly: false
+
+# --- Instrument ---
+instrument:
+  symbol: "NQ"                # "NQ" or "MNQ"
+  exchange: "CME"
+  currency: "USD"
+  sec_type: "FUT"
+  # point_value is auto-set: $20 for NQ, $2 for MNQ
+  tick_size: 0.25
+  # Commission per round-trip
+  commission_nq: 4.00
+  commission_mnq: 1.00
+
+# --- Data / Timeframes ---
+data:
+  execution_bar_type: "time"   # "time" or "tick"
+  execution_bar_size: 5        # 5 seconds or 1000 ticks
+  confirmation_bar_seconds: 60 # 1-minute bars
+  tick_bar_size: 1000          # If using tick bars
+
+# --- Indicators ---
+indicators:
+  ema_fast: 9
+  ema_slow: 21
+  atr_period: 14
+  volume_sma_period: 20
+  vwap_band_multipliers: [1.0, 2.0]   # σ bands
+
+# --- Entry Conditions ---
+entry:
+  # Price location
+  pullback_distance: 2.0       # Max points from VWAP or EMA21 for mean-reversion entry
+
+  # Momentum
+  # EMA crossover + 1-min bar color checked in signals.py
+
+  # Order flow
+  cvd_lookback_bars: 3         # Number of bars to check CVD trend
+  volume_spike_multiplier: 1.3 # Current volume must be >= this × 20-bar SMA
+
+  # Volatility filter
+  atr_min: 1.5                 # Minimum 1-min ATR to trade
+  atr_max: 8.0                 # Maximum 1-min ATR to trade
+
+# --- Time Filter ---
+time_filter:
+  timezone: "US/Eastern"
+  sessions:
+    - start: "09:35"
+      end: "11:30"
+    - start: "13:30"
+      end: "15:45"
+  avoid_after_open_minutes: 5   # Skip first N min after RTH open
+  avoid_before_close_minutes: 15
+  news_blackout_minutes: 5      # ±N minutes around high-impact events
+  economic_calendar_file: "economic_calendar.json"  # Path to calendar JSON
+
+# --- Position Sizing ---
+sizing:
+  risk_pct: 0.01               # 1% of equity per trade
+  max_contracts_nq: 4
+  max_contracts_mnq: 40
+
+# --- Exit / Trade Management ---
+exits:
+  # Stop loss
+  stop_atr_multiplier: 1.2
+  stop_min_points: 4.0
+  stop_max_points: 10.0
+
+  # Take profit
+  tp1_atr_multiplier: 1.0      # Target 1: 1×ATR
+  tp1_pct: 0.50                # Close 50% at Target 1
+  tp2_atr_multiplier: 2.0      # Target 2: 2×ATR (or VWAP band, whichever first)
+  tp2_pct: 0.50                # Close remaining 50% at Target 2
+
+  # Trailing stop (activates after TP1)
+  trail_atr_multiplier: 0.8
+
+  # Breakeven
+  breakeven_atr_multiplier: 0.5 # Move stop to BE after this much profit
+  breakeven_offset_ticks: 1     # BE + N ticks
+
+  # Time-based
+  max_trade_duration_seconds: 300  # 5 minutes
+  eod_close_time: "15:50"         # Close all by this time ET
+
+# --- Risk Management / Circuit Breakers ---
+risk:
+  daily_loss_limit_pct: 0.03       # -3% of equity → stop for the day
+  consecutive_loss_pause: 3        # After N consecutive losers
+  consecutive_loss_pause_minutes: 30
+  daily_trade_limit: 20            # Max round-trips per day
+  max_drawdown_pct: 0.06           # -6% from HWM → shut down bot
+
+# --- Logging ---
+logging:
+  trade_log_db: "trades.db"        # SQLite database file
+  log_level: "INFO"                # DEBUG, INFO, WARNING, ERROR
+  log_file: "scalper.log"
+
+# --- Alerts ---
+alerts:
+  enabled: false
+  method: "telegram"               # "telegram" or "discord"
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  discord_webhook_url: ""
+
+# --- Backtesting ---
+backtest:
+  data_file: ""                    # Path to historical tick/bar data (CSV or Parquet)
+  slippage_ticks: 1                # 1 tick = 0.25 points per side
+  initial_equity: 100000.0
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
