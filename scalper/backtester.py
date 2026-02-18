@@ -185,21 +185,23 @@ class Backtester:
 
         # ── Normalise timestamp to epoch seconds ─────────────
         if "timestamp" in df.columns:
-            if df["timestamp"].dtype == object:
-                # ISO-8601 strings (e.g. "2026-02-15 23:00:00+00:00")
+            col = df["timestamp"]
+            is_str = (
+                pd.api.types.is_string_dtype(col)
+                or pd.api.types.is_object_dtype(col)
+            )
+            is_dt = pd.api.types.is_datetime64_any_dtype(col)
+            is_numeric = pd.api.types.is_numeric_dtype(col)
+
+            if is_str or is_dt:
+                # ISO-8601 strings or datetime objects → epoch seconds
                 df["timestamp"] = (
                     pd.to_datetime(df["timestamp"], utc=True)
                     .astype("int64") // 10**9
                 )
-            elif hasattr(df["timestamp"].dtype, "tz") or pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-                # Already datetime dtype (from parquet or tz-aware)
-                df["timestamp"] = (
-                    pd.to_datetime(df["timestamp"], utc=True)
-                    .astype("int64") // 10**9
-                )
-            elif df["timestamp"].max() > 1e12:
-                # Milliseconds
-                df["timestamp"] = df["timestamp"] / 1000.0
+            elif is_numeric and col.max() > 1e12:
+                # Milliseconds → seconds
+                df["timestamp"] = col / 1000.0
             # else: already epoch seconds
 
         df = df.sort_values("timestamp").reset_index(drop=True)
