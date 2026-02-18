@@ -222,12 +222,14 @@ class Backtester:
         )
 
         if is_str or is_dt:
-            # ISO-8601 strings or datetime objects → epoch seconds
+            # ISO-8601 strings or datetime objects → epoch seconds.
+            # Use total_seconds() which is resolution-agnostic
+            # (pandas 2.0+ defaults to datetime64[us], not [ns]).
             logger.info("Converting timestamps from string/datetime to epoch seconds")
+            _epoch = pd.Timestamp("1970-01-01", tz="UTC")
             df["timestamp"] = (
-                pd.to_datetime(df["timestamp"], utc=True)
-                .astype("int64") // 10**9
-            )
+                pd.to_datetime(df["timestamp"], utc=True) - _epoch
+            ).dt.total_seconds()
         elif is_numeric:
             max_val = float(col.max())
             if max_val > 1e15:
