@@ -176,12 +176,21 @@ class Backtester:
         else:
             df = pd.read_csv(path)
 
+        # ── Raw data diagnostics ─────────────────────────────
+        logger.info(
+            "Raw CSV columns: %s", list(df.columns),
+        )
+        logger.info(
+            "Raw CSV dtypes:\n%s", df.dtypes.to_string(),
+        )
+        logger.info("First row:\n%s", df.iloc[0].to_string())
+
         # ── Normalise column names ───────────────────────────
         rename_map: dict[str, str] = {}
         # Prefer Databento's ts_event over any existing timestamp column
         if "ts_event" in df.columns:
             if "timestamp" in df.columns:
-                logger.debug(
+                logger.info(
                     "Both 'ts_event' and 'timestamp' present; "
                     "using 'ts_event' (Databento authoritative)."
                 )
@@ -190,53 +199,63 @@ class Backtester:
         if rename_map:
             df = df.rename(columns=rename_map)
 
-        # ── Normalise timestamp to epoch seconds ─────────────
-        if "timestamp" in df.columns:
-            col = df["timestamp"]
-            is_str = (
-                pd.api.types.is_string_dtype(col)
-                or pd.api.types.is_object_dtype(col)
+        if "timestamp" not in df.columns:
+            raise ValueError(
+                f"No 'timestamp' or 'ts_event' column found. "
+                f"Available columns: {list(df.columns)}"
             )
-            is_dt = pd.api.types.is_datetime64_any_dtype(col)
-            is_numeric = pd.api.types.is_numeric_dtype(col)
 
-            if is_str or is_dt:
-                # ISO-8601 strings or datetime objects → epoch seconds
-                df["timestamp"] = (
-                    pd.to_datetime(df["timestamp"], utc=True)
-                    .astype("int64") // 10**9
-                )
-            elif is_numeric:
-                max_val = float(col.max())
-                if max_val > 1e15:
-                    # Nanoseconds → seconds (Databento / nanosecond epoch)
-                    logger.debug("Detected nanosecond timestamps (max=%.2e)", max_val)
-                    df["timestamp"] = col / 1e9
-                elif max_val > 1e12:
-                    # Milliseconds → seconds
-                    logger.debug("Detected millisecond timestamps (max=%.2e)", max_val)
-                    df["timestamp"] = col / 1e3
-                # else: already epoch seconds
+        # ── Normalise timestamp to epoch seconds ─────────────
+        col = df["timestamp"]
+        is_str = (
+            pd.api.types.is_string_dtype(col)
+            or pd.api.types.is_object_dtype(col)
+        )
+        is_dt = pd.api.types.is_datetime64_any_dtype(col)
+        is_numeric = pd.api.types.is_numeric_dtype(col)
 
-            # Sanity check: timestamps should be in a reasonable range
-            ts_min = float(df["timestamp"].min())
-            ts_max = float(df["timestamp"].max())
-            # 2000-01-01 = 946684800, 2040-01-01 = 2208988800
-            if ts_min < 946684800 or ts_max > 2208988800:
-                logger.warning(
-                    "Timestamps out of expected range after conversion "
-                    "(min=%.2f → %s, max=%.2f → %s). "
-                    "Check that your data uses epoch-seconds, milliseconds, "
-                    "or nanoseconds.",
-                    ts_min,
-                    datetime.utcfromtimestamp(
-                        max(0, min(ts_min, 32503680000))
-                    ).strftime("%Y-%m-%d"),
-                    ts_max,
-                    datetime.utcfromtimestamp(
-                        max(0, min(ts_max, 32503680000))
-                    ).strftime("%Y-%m-%d"),
+        raw_min = col.min()
+        raw_max = col.max()
+        logger.info(
+            "Timestamp column — dtype: %s, min: %s, max: %s",
+            col.dtype, raw_min, raw_max,
+        )
+
+        if is_str or is_dt:
+            # ISO-8601 strings or datetime objects → epoch seconds
+            logger.info("Converting timestamps from string/datetime to epoch seconds")
+            df["timestamp"] = (
+                pd.to_datetime(df["timestamp"], utc=True)
+                .astype("int64") // 10**9
+            )
+        elif is_numeric:
+            max_val = float(col.max())
+            if max_val > 1e15:
+                # Nanoseconds → seconds (Databento / nanosecond epoch)
+                logger.info("Converting nanosecond timestamps (max=%.2e) → epoch seconds", max_val)
+                df["timestamp"] = col / 1e9
+            elif max_val > 1e12:
+                # Milliseconds → seconds
+                logger.info("Converting millisecond timestamps (max=%.2e) → epoch seconds", max_val)
+                df["timestamp"] = col / 1e3
+            else:
+                logger.info(
+                    "Timestamps appear numeric with max=%.2e; assuming epoch seconds",
+                    max_val,
                 )
+
+        # Sanity check: timestamps should be in a reasonable range
+        ts_min = float(df["timestamp"].min())
+        ts_max = float(df["timestamp"].max())
+        # 2000-01-01 = 946684800, 2040-01-01 = 2208988800
+        if ts_min < 946684800 or ts_max > 2208988800:
+            logger.warning(
+                "⚠ Timestamps out of expected range after conversion "
+                "(min=%.2f, max=%.2f). Expected epoch seconds in "
+                "[946684800 (2000-01-01) .. 2208988800 (2040-01-01)]. "
+                "Raw column had min=%s, max=%s, dtype=%s.",
+                ts_min, ts_max, raw_min, raw_max, col.dtype,
+            )
 
         df = df.sort_values("timestamp").reset_index(drop=True)
         logger.info("Loaded %d rows from %s", len(df), self._data_file)
