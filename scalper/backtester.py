@@ -178,7 +178,14 @@ class Backtester:
 
         # ── Normalise column names ───────────────────────────
         rename_map: dict[str, str] = {}
-        if "ts_event" in df.columns and "timestamp" not in df.columns:
+        # Prefer Databento's ts_event over any existing timestamp column
+        if "ts_event" in df.columns:
+            if "timestamp" in df.columns:
+                logger.debug(
+                    "Both 'ts_event' and 'timestamp' present; "
+                    "using 'ts_event' (Databento authoritative)."
+                )
+                df = df.drop(columns=["timestamp"])
             rename_map["ts_event"] = "timestamp"
         if rename_map:
             df = df.rename(columns=rename_map)
@@ -199,10 +206,37 @@ class Backtester:
                     pd.to_datetime(df["timestamp"], utc=True)
                     .astype("int64") // 10**9
                 )
-            elif is_numeric and col.max() > 1e12:
-                # Milliseconds → seconds
-                df["timestamp"] = col / 1000.0
-            # else: already epoch seconds
+            elif is_numeric:
+                max_val = float(col.max())
+                if max_val > 1e15:
+                    # Nanoseconds → seconds (Databento / nanosecond epoch)
+                    logger.debug("Detected nanosecond timestamps (max=%.2e)", max_val)
+                    df["timestamp"] = col / 1e9
+                elif max_val > 1e12:
+                    # Milliseconds → seconds
+                    logger.debug("Detected millisecond timestamps (max=%.2e)", max_val)
+                    df["timestamp"] = col / 1e3
+                # else: already epoch seconds
+
+            # Sanity check: timestamps should be in a reasonable range
+            ts_min = float(df["timestamp"].min())
+            ts_max = float(df["timestamp"].max())
+            # 2000-01-01 = 946684800, 2040-01-01 = 2208988800
+            if ts_min < 946684800 or ts_max > 2208988800:
+                logger.warning(
+                    "Timestamps out of expected range after conversion "
+                    "(min=%.2f → %s, max=%.2f → %s). "
+                    "Check that your data uses epoch-seconds, milliseconds, "
+                    "or nanoseconds.",
+                    ts_min,
+                    datetime.utcfromtimestamp(
+                        max(0, min(ts_min, 32503680000))
+                    ).strftime("%Y-%m-%d"),
+                    ts_max,
+                    datetime.utcfromtimestamp(
+                        max(0, min(ts_max, 32503680000))
+                    ).strftime("%Y-%m-%d"),
+                )
 
         df = df.sort_values("timestamp").reset_index(drop=True)
         logger.info("Loaded %d rows from %s", len(df), self._data_file)
@@ -281,7 +315,9 @@ class Backtester:
 
         # Diagnostic counters for signal failures
         _diag_evals = 0
-        _diag_failures: dict[str, int] = {}
+        _diag_long_failures: dict[str, int] = {}
+        _diag_short_failures: dict[str, int] = {}
+        _diag_risk_blocked = 0
 
         for idx, row in data.iterrows():
             ts = float(row["timestamp"])
@@ -347,16 +383,22 @@ class Backtester:
             # Signal evaluation
             if not self._execution.has_position:
                 can, reason = self._risk_manager.can_trade(self._equity)
+                if not can:
+                    _diag_risk_blocked += 1
                 if can:
                     state = self._indicators.snapshot(self._last_sim_price, 0)
                     dt_et = datetime.utcfromtimestamp(ts).replace(tzinfo=pytz.utc).astimezone(ET)
                     result = self._signal_engine.evaluate(state, dt_et)
 
-                    # Track why signals fail
+                    # Track why signals fail — per side
                     _diag_evals += 1
-                    if result.signal == Signal.HOLD and result.failed:
-                        for f in result.failed:
-                            _diag_failures[f] = _diag_failures.get(f, 0) + 1
+                    if result.signal == Signal.HOLD:
+                        long_r = self._signal_engine._check_long(state, dt_et)
+                        short_r = self._signal_engine._check_short(state, dt_et)
+                        for f in (long_r.failed or []):
+                            _diag_long_failures[f] = _diag_long_failures.get(f, 0) + 1
+                        for f in (short_r.failed or []):
+                            _diag_short_failures[f] = _diag_short_failures.get(f, 0) + 1
 
                     if result.signal in (Signal.BUY, Signal.SELL):
                         # Compute stop and size
@@ -381,15 +423,18 @@ class Backtester:
 
         # ── Signal failure diagnostics ────────────────────────
         if _diag_evals > 0:
-            logger.info("Signal evaluations: %d", _diag_evals)
-            logger.info("Signal failure breakdown (most common first):")
-            for reason, count in sorted(_diag_failures.items(), key=lambda x: -x[1]):
-                pct = count / _diag_evals * 100
-                logger.info("  %-35s %5d  (%5.1f%%)", reason, count, pct)
+            logger.info("Signal evaluations: %d (risk-blocked: %d)", _diag_evals, _diag_risk_blocked)
+            for label, failures in [("LONG", _diag_long_failures), ("SHORT", _diag_short_failures)]:
+                if failures:
+                    logger.info("%s failure breakdown:", label)
+                    for reason, count in sorted(failures.items(), key=lambda x: -x[1]):
+                        pct = count / _diag_evals * 100
+                        logger.info("  %-35s %5d  (%5.1f%%)", reason, count, pct)
         else:
             logger.warning(
                 "No signal evaluations occurred — all rows were either "
-                "outside trading windows or blocked by risk manager."
+                "outside trading windows or blocked by risk manager "
+                "(risk-blocked: %d).", _diag_risk_blocked,
             )
 
         # Force-close any remaining position
